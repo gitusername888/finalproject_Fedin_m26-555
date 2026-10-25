@@ -1,64 +1,50 @@
+"""CLI ValutaTrade Hub. Единственная точка входа для команд.
 
-"""CLI ValutaTrade Hub — единственная точка входа для пользовательских команд.
-
-Здесь только разбор аргументов и вывод: бизнес-логика живёт в core/usecases.py.
+interface.py тонкий: только разбор аргументов и печать; вся бизнес-логика — в usecases.
 """
-
 from valutatrade_hub.core import usecases
-from valutatrade_hub.core.models import User
+from valutatrade_hub.core.currencies import CurrencyRegistry
+from valutatrade_hub.core.exceptions import (
+    ApiRequestError,
+    CurrencyNotFoundError,
+    InsufficientFundsError,
+)
+from valutatrade_hub.core.utils import format_amount, format_money
+from valutatrade_hub.logging_config import setup_logging
 
-# Текущая сессия (в рамках одного запуска процесса)
-session: dict = {"user": None}
-
-
-def _require_login() -> User:
-    if session["user"] is None:
-        raise usecases.UsecaseError("Сначала выполните login")
-    return session["user"]
-
-
-def _parse_args(tokens: list) -> dict:
-    """Разбор флагов вида --key value."""
-    parsed, i = {}, 0
-    while i < len(tokens):
-        token = tokens[i]
-        if token.startswith("--"):
-            key = token[2:]
-            if i + 1 >= len(tokens):
-                raise usecases.UsecaseError(f"Не указано значение для --{key}")
-            parsed[key] = tokens[i + 1]
-            i += 2
-        else:
-            i += 1
-    return parsed
+session = {"user": None}
 
 
-def _get(args: dict, key: str) -> str:
-    if key not in args:
-        raise usecases.UsecaseError(f"Укажите обязательный аргумент --{key}")
-    return args[key]
+def _get(tokens: list, flag: str) -> str | None:
+    if flag in tokens:
+        i = tokens.index(flag)
+        if i + 1 < len(tokens):
+            return tokens[i + 1]
+    return None
 
-
-# ---------------- команды ----------------
 
 def cmd_register(tokens: list) -> None:
-    args = _parse_args(tokens)
+    username, password = _get(tokens, "--username"), _get(tokens, "--password")
+    if not username or not password:
+        print("Использование: register --username <имя> --password <пароль>")
+        return
     try:
-        user = usecases.register_user(_get(args, "username"), _get(args, "password"))
-    except usecases.UsecaseError as e:
+        user = usecases.register_user(username, password)
+    except ValueError as e:
         print(e)
         return
-    print(
-        f"Пользователь '{user.username}' зарегистрирован (id={user.user_id}). "
-        f"Войдите: login --username {user.username} --password ****"
-    )
+    print(f"Пользователь '{user.username}' зарегистрирован (id={user.user_id}). "
+          f"Войдите: login --username {user.username} --password ****")
 
 
 def cmd_login(tokens: list) -> None:
-    args = _parse_args(tokens)
+    username, password = _get(tokens, "--username"), _get(tokens, "--password")
+    if not username or not password:
+        print("Использование: login --username <имя> --password <пароль>")
+        return
     try:
-        user = usecases.login_user(_get(args, "username"), _get(args, "password"))
-    except usecases.UsecaseError as e:
+        user = usecases.login_user(username, password)
+    except ValueError as e:
         print(e)
         return
     session["user"] = user
@@ -66,99 +52,137 @@ def cmd_login(tokens: list) -> None:
 
 
 def cmd_show_portfolio(tokens: list) -> None:
-    args = _parse_args(tokens)
-    try:
-        user = _require_login()
-        overview = usecases.get_portfolio_overview(user, args.get("base", "USD"))
-    except usecases.UsecaseError as e:
-        print(e)
+    if session["user"] is None:
+        print("Сначала выполните login")
         return
-    print(f"Портфель пользователя '{user.username}' (база: {overview['base']}):")
-    for code, balance, value in overview["rows"]:
-        print(f"- {code}: {usecases.fmt_amount(code, balance)}  →  {value:,.2f} {overview['base']}")
+    base = _get(tokens, "--base") or usecases.settings.get("default_base_currency", "USD")
+    try:
+        summary = usecases.get_portfolio_summary(session["user"], base)
+    except CurrencyNotFoundError as e:
+        print(f"{e} Поддерживаемые коды: {', '.join(CurrencyRegistry.supported_codes())}")
+        return
+    if not summary["rows"]:
+        print("Портфель пуст — кошельков ещё нет.")
+        return
+    print(f"Портфель пользователя '{session['user'].username}' (база: {summary['base']}):")
+    for row in summary["rows"]:
+        print(f"- {row['code']}: {format_amount(row['balance'], row['code'])}  "
+              f"→ {format_money(row['value_in_base'])} {summary['base']}")
     print("-" * 33)
-    print(f"ИТОГО: {overview['total']:,.2f} {overview['base']}")
+    print(f"ИТОГО: {format_money(summary['total'])} {summary['base']}")
+
+
+def _parse_amount(raw: str | None):
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        print("'amount' должен быть положительным числом")
+        return None
 
 
 def cmd_buy(tokens: list) -> None:
-    args = _parse_args(tokens)
+    if session["user"] is None:
+        print("Сначала выполните login")
+        return
+    currency, amount = _get(tokens, "--currency"), _parse_amount(_get(tokens, "--amount"))
+    if not currency or amount is None:
+        print("Использование: buy --currency <код> --amount <сумма>")
+        return
     try:
-        user = _require_login()
-        r = usecases.buy_currency(user, _get(args, "currency"), _get(args, "amount"))
-    except usecases.UsecaseError as e:
+        result = usecases.buy_currency(session["user"], currency, amount)
+    except (InsufficientFundsError, ApiRequestError) as e:
         print(e)
         return
-    print(f"Покупка выполнена: {r['amount']:.4f} {r['code']} по курсу {r['rate']:.2f} USD/{r['code']}")
+    except CurrencyNotFoundError as e:
+        print(f"{e} Поддерживаемые коды: {', '.join(CurrencyRegistry.supported_codes())}")
+        return
+    except ValueError as e:
+        print(f"Ошибка: {e}")
+        return
+    code = currency.upper()
+    print(f"Покупка выполнена: {format_amount(amount, code)} {code} "
+          f"по курсу {format_money(result['rate'])} USD/{code}")
     print("Изменения в портфеле:")
-    print(f"- {r['code']}: было {usecases.fmt_amount(r['code'], r['before'])} "
-          f"→ стало {usecases.fmt_amount(r['code'], r['after'])}")
-    print(f"Оценочная стоимость покупки: {r['cost']:,.2f} USD")
+    print(f"- {code}: было {format_amount(result['was'], code)} → "
+          f"стало {format_amount(result['became'], code)}")
+    print(f"Оценочная стоимость покупки: {format_money(result['cost'])} USD")
 
 
 def cmd_sell(tokens: list) -> None:
-    args = _parse_args(tokens)
+    if session["user"] is None:
+        print("Сначала выполните login")
+        return
+    currency, amount = _get(tokens, "--currency"), _parse_amount(_get(tokens, "--amount"))
+    if not currency or amount is None:
+        print("Использование: sell --currency <код> --amount <сумма>")
+        return
     try:
-        user = _require_login()
-        r = usecases.sell_currency(user, _get(args, "currency"), _get(args, "amount"))
-    except usecases.UsecaseError as e:
+        result = usecases.sell_currency(session["user"], currency, amount)
+    except InsufficientFundsError as e:
         print(e)
         return
-    print(f"Продажа выполнена: {r['amount']:.4f} {r['code']} по курсу {r['rate']:.2f} USD/{r['code']}")
+    except ApiRequestError as e:
+        print(e)
+        return
+    except CurrencyNotFoundError as e:
+        print(f"{e} Поддерживаемые коды: {', '.join(CurrencyRegistry.supported_codes())}")
+        return
+    except KeyError as e:
+        print(e.args[0])
+        return
+    except ValueError as e:
+        print(f"Ошибка: {e}")
+        return
+    code = currency.upper()
+    print(f"Продажа выполнена: {format_amount(amount, code)} {code} "
+          f"по курсу {format_money(result['rate'])} USD/{code}")
     print("Изменения в портфеле:")
-    print(f"- {r['code']}: было {usecases.fmt_amount(r['code'], r['before'])} "
-          f"→ стало {usecases.fmt_amount(r['code'], r['after'])}")
-    print(f"Оценочная выручка: {r['proceeds']:,.2f} USD")
+    print(f"- {code}: было {format_amount(result['was'], code)} → "
+          f"стало {format_amount(result['became'], code)}")
+    print(f"Оценочная выручка: {format_money(result['proceeds'])} USD")
 
 
 def cmd_get_rate(tokens: list) -> None:
-    args = _parse_args(tokens)
-    f, t = args.get("from", ""), args.get("to", "")
+    from_code, to_code = _get(tokens, "--from"), _get(tokens, "--to")
+    if not from_code or not to_code:
+        print("Использование: get-rate --from <код> --to <код>")
+        return
     try:
-        rate, when = usecases.get_rate(_get(args, "from"), _get(args, "to"))
-    except usecases.UsecaseError as e:
-        print(e)
+        data = usecases.get_rate(from_code, to_code)
+    except CurrencyNotFoundError:
+        raise  # перехватываем в run() — там печатаем список поддерживаемых кодов
+    except ApiRequestError as e:
+        print(f"{e}. Повторите попытку позже или проверьте сеть.")
         return
-    stamp = when.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"Курс {f.upper()}→{t.upper()}: {rate:.8f} (обновлено: {stamp})")
-    if rate:
-        print(f"Обратный курс {t.upper()}→{f.upper()}: {1 / rate:.2f}")
-
-
-def cmd_logout(_: list) -> None:
-    if session["user"] is None:
-        print("Вы и так не вошли.")
-        return
-    print(f"Вы вышли из аккаунта '{session['user'].username}'.")
-    session["user"] = None
-
-
-def cmd_help(_: list) -> None:
-    print(
-        "Доступные команды:\n"
-        "  register --username <имя> --password <пароль>\n"
-        "  login --username <имя> --password <пароль>\n"
-        "  logout\n"
-        "  show-portfolio [--base USD]\n"
-        "  buy --currency <код> --amount <число>\n"
-        "  sell --currency <код> --amount <число>\n"
-        "  get-rate --from <код> --to <код>\n"
-        "  help | exit"
-    )
+    ts = data["updated_at"].replace("T", " ").split(".")[0]
+    print(f"Курс {from_code.upper()}→{to_code.upper()}: {data['rate']:.8f} (обновлено: {ts})")
+    print(f"Обратный курс {to_code.upper()}→{from_code.upper()}: {1 / data['rate']:.2f}")
 
 
 COMMANDS = {
     "register": cmd_register,
     "login": cmd_login,
-    "logout": cmd_logout,
     "show-portfolio": cmd_show_portfolio,
     "buy": cmd_buy,
     "sell": cmd_sell,
     "get-rate": cmd_get_rate,
-    "help": cmd_help,
+    "help": lambda _: print(
+        "Доступные команды:\n"
+        "  register --username <имя> --password <пароль>\n"
+        "  login --username <имя> --password <пароль>\n"
+        "  show-portfolio [--base <код>]\n"
+        "  buy --currency <код> --amount <сумма>\n"
+        "  sell --currency <код> --amount <сумма>\n"
+        "  get-rate --from <код> --to <код>\n"
+        "  exit — выход"
+    ),
 }
 
 
 def run() -> None:
+    setup_logging()
     print("ValutaTrade Hub. Введите 'help' для списка команд.")
     while True:
         try:
@@ -173,10 +197,14 @@ def run() -> None:
         if cmd in ("exit", "quit"):
             break
         handler = COMMANDS.get(cmd)
-        if handler:
-            try:
-                handler(tokens)
-            except usecases.UsecaseError as e:
-                print(e)
-        else:
+        if not handler:
             print(f"Неизвестная команда: {cmd}. Введите 'help'.")
+            continue
+        try:
+            handler(tokens)
+        except CurrencyNotFoundError as e:
+            print(f"{e} Поддерживаемые коды: {', '.join(CurrencyRegistry.supported_codes())}")
+        except ApiRequestError as e:
+            print(f"{e}. Повторите попытку позже или проверьте сеть.")
+        except (InsufficientFundsError, ValueError, KeyError) as e:
+            print(e)
